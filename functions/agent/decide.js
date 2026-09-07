@@ -17,13 +17,18 @@
 //   sig      = HMAC-SHA256(OG_SEAL_SECRET, payload)
 //   router_proof = Router 回應中的 TEE 證明原文（由 extract_proof 取得）
 
-// ── 一行替換點 ①：Router 位址與驗證方式 ─────────────────────────────
-// Workshop 確認後只改這兩處。若需要 per-request 錢包簽名，只補在 sign_request()。
-const OG_ROUTER_URL_DEFAULT = 'https://api.0g.ai/v1/chat/completions';
-const OG_MODEL = '0GM-1.0-35B-A3B';
+// ── 一行替換點 ①：Router 位址與驗證方式（已依 docs.0g.ai 填入正式值）──────
+// 0G Compute Router：OpenAI 相容，Authorization: Bearer sk-…，不需 per-request 錢包簽名。
+// 文件：https://docs.0g.ai/developer-hub/building-on-0g/compute-network/router/overview
+const OG_ROUTER_URL_DEFAULT = 'https://router-api.0g.ai/v1/chat/completions';
+// Router 的模型 id 是小寫（GET /v1/models 回 "0gm-1.0-35b-a3b"，name 為 0GM-1.0-35B-A3B）。
+const OG_MODEL = '0gm-1.0-35b-a3b';
 
-// 一行替換點 ②：TEE 證明放在哪個 response header。
-const OG_PROOF_HEADER = 'X-Agent-Proof';
+// 一行替換點 ②：TEE 證明的來源（已依 docs.0g.ai 填入正式值）
+//   請求帶 verify_tee: true → Router 同步驗證 provider 的 TEE 簽名，
+//   回應 body 的 x_0g_trace 帶 { request_id, provider, tee_verified }，
+//   回應 header ZG-Res-Key 帶 provider 的 response id（chatID），可對 provider 再驗一次。
+const OG_PROOF_HEADER = 'ZG-Res-Key';
 
 const DEFAULT_TIMEOUT_MS = 9000;
 // OG_SEAL_SECRET 未設時的本機開發用金鑰；verify.js 使用同一個常數，
@@ -49,7 +54,7 @@ export async function onRequestPost(context) {
 
   try {
     const messages = buildMessages(civilization, board, turn, validActions);
-    const { text, response, chatId } = await callRouter(env, messages);
+    const { text, response, json, chatId } = await callRouter(env, messages);
     const parsed = parseJsonLoose(text);
     if (!parsed || typeof parsed !== 'object') {
       return jsonOut({ fallback: true, reason: 'unparseable reply' });
@@ -64,7 +69,7 @@ export async function onRequestPost(context) {
       target: String(parsed.target || 'player'),
     };
 
-    const routerProof = extract_proof(response);
+    const routerProof = extract_proof(response, json);
     const proof = await sealDecision(env, {
       civilization, turn, board, action, intentText, routerProof, chatId,
     });
@@ -96,14 +101,14 @@ function routerConfigured(env) {
 }
 
 // 一行替換點 ①（續）：每個請求的驗證標頭都在這裡產生。
-// 目前假設標準 Authorization: Bearer。若 Workshop 確認需要錢包簽名，
-// 只在此函式內補上（例如以 OG_WALLET_PRIVKEY 對 body 簽名後放進標頭）。
+// 0G Router 文件明載「no wallet signature per request」，只需 Bearer sk- key；
+// 若日後改成需要簽名，只在此函式內補上。
 async function sign_request(env, _bodyText) {
   const headers = {
     'content-type': 'application/json',
     authorization: `Bearer ${env.OG_API_KEY}`,
   };
-  if (env.OG_AGENT_ID) headers['x-agent-id'] = env.OG_AGENT_ID; // 0G Agentic ID
+  // 0G Agentic ID（ERC-7857 token，格式 "<contract>:<tokenId>"）只封進印章，Router 本身不認這個標頭。
   return headers;
 }
 
@@ -116,7 +121,12 @@ async function callRouter(env, messages) {
       model: env.OG_MODEL || OG_MODEL,
       messages,
       temperature: 0.4,
-      max_tokens: 200,
+      max_tokens: 400,
+      // 0GM 預設開 thinking；關掉以免 max_tokens 被思考吃光、content 空白。
+      chat_template_kwargs: { enable_thinking: false },
+      response_format: { type: 'json_object' },
+      // 0G Router 擴充欄位：要求同步驗證 provider 的 TEE 簽名。
+      verify_tee: true,
     });
     // ↓ 這一行就是真正打到 0G Compute Router 的請求。
     const r = await fetch(url, {
@@ -129,18 +139,29 @@ async function callRouter(env, messages) {
     const j = await r.json();
     const txt = j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
     if (!txt) throw new Error('router empty');
-    return { text: txt, response: r, chatId: String((j && j.id) || '') };
+    return { text: txt, response: r, json: j, chatId: String((j && j.id) || '') };
   } finally {
     clearTimeout(timer);
   }
 }
 
 // 一行替換點 ②（續）：TEE 證明的取值邏輯「只」存在這個函式。
-// 目前假設 Router 以 response header 回傳；若 Workshop 確認是放在 body
-// 的某個欄位，改這裡即可（callRouter 已把 response 物件整個傳進來）。
-function extract_proof(response) {
-  const v = response && response.headers && response.headers.get(OG_PROOF_HEADER);
-  return v ? String(v) : null;
+// 把 0G Router 的 TEE 證據封成一個固定鍵序的 JSON 字串，原文進印章：
+//   res_key      ZG-Res-Key header（provider 的 response id / chatID）
+//   request_id   x_0g_trace.request_id（Router 端的請求 id）
+//   provider     x_0g_trace.provider（provider 的鏈上地址）
+//   tee_verified x_0g_trace.tee_verified（Router 同步驗過 TEE 簽名的結果）
+// 若 Router 完全沒回這些欄位（例如換了別的 OpenAI 相容端點），回 null。
+function extract_proof(response, json) {
+  const resKey = response && response.headers && response.headers.get(OG_PROOF_HEADER);
+  const trace = json && json.x_0g_trace;
+  if (!resKey && !trace) return null;
+  return JSON.stringify({
+    res_key: resKey ? String(resKey) : null,
+    request_id: trace && trace.request_id ? String(trace.request_id) : null,
+    provider: trace && trace.provider ? String(trace.provider) : null,
+    tee_verified: trace && typeof trace.tee_verified !== 'undefined' ? trace.tee_verified : null,
+  });
 }
 
 function buildMessages(civilization, board, turn, validActions) {

@@ -87,12 +87,20 @@ export async function onRequest(context) {
   return jsonOut({ valid: false, details: { error: 'POST only' } });
 }
 
-// ── 一行替換點：TEE 證明的驗證方式 ──────────────────────────────────
-// 目前 Router 的證明格式要等 Workshop 才確認；先做「存在且非空字串」檢查。
-// 確認後（例如 ECDSA over sha256(payload) 對 0G TEE 公鑰），只改這個函式。
+// ── 一行替換點：TEE 證明的驗證方式（已依 0G Router 的 x_0g_trace 格式填入）──
+// router_proof 是 decide.js extract_proof() 封進的 JSON 字串：
+//   { res_key, request_id, provider, tee_verified }
+// 離線判定：tee_verified === true、provider 是 0x 開頭 40 碼 hex、request_id 非空。
+// （tee_verified 是 Router 以 verify_tee: true 同步驗過 provider TEE 簽名的結果；
+//   要再向 provider 本人核對，可用 res_key 走 0G SDK 的 processResponse。）
 async function verify_router_proof(routerProof, _payload, _env) {
-  if (!routerProof) return false;
-  return typeof routerProof === 'string' && routerProof.trim().length > 0;
+  if (!routerProof || typeof routerProof !== 'string') return false;
+  let p;
+  try { p = JSON.parse(routerProof); } catch (_) { return false; }
+  if (!p || typeof p !== 'object') return false;
+  const providerOk = typeof p.provider === 'string' && /^0x[0-9a-fA-F]{40}$/.test(p.provider);
+  const idOk = typeof p.request_id === 'string' && p.request_id.length > 0;
+  return p.tee_verified === true && providerOk && idOk;
 }
 
 async function lookupById(env, id) {
