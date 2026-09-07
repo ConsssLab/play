@@ -256,6 +256,8 @@ fully forward-compatible with the deployed mainnet package.
 > 玩家必須先相信 ConSSS 沒作弊。換成 TEE 簽出的章之後，「AI 判了什麼」變成
 > 任何人都能獨立驗證的事實，不需要相信我們。
 
+**5 分鐘 Pitch 頁**：https://hack-0g.consss-play.pages.dev/pitch （`public/pitch.html`）
+
 ### 整合點（評審請看這裡）
 
 | 事情 | 檔案 | 位置 |

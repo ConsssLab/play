@@ -13,3 +13,7 @@ npm i ethers@6 solc@0.8.28
 node -e "const solc=require('solc'),fs=require('fs');const o=JSON.parse(solc.compile(JSON.stringify({language:'Solidity',sources:{'AgenticID.sol':{content:fs.readFileSync('AgenticID.sol','utf8')}},settings:{optimizer:{enabled:true,runs:200},outputSelection:{'*':{'*':['abi','evm.bytecode.object']}}}})));const c=o.contracts['AgenticID.sol'].AgenticID;fs.writeFileSync('AgenticID.json',JSON.stringify({abi:c.abi,bytecode:'0x'+c.evm.bytecode.object}))"
 node deploy_and_mint.mjs <持有者地址>
 ```
+
+## Pitch
+
+5 分鐘展示稿：https://hack-0g.consss-play.pages.dev/pitch （原始檔 `public/pitch.html`）
