@@ -260,11 +260,11 @@ fully forward-compatible with the deployed mainnet package.
 
 | 事情 | 檔案 | 位置 |
 |---|---|---|
-| **真的打到 0G Compute Router 的那一行** | `functions/agent/decide.js` | `callRouter()` 內的 `fetch(url, …)`，第 122 行；模型常數 `OG_MODEL = '0GM-1.0-35B-A3B'` |
-| Router 驗證標頭（一行替換點 ①） | `functions/agent/decide.js` | `sign_request()`，第 101 行。目前 `Authorization: Bearer`，並帶 `x-agent-id`（Agentic ID）。需錢包簽名時只改這裡 |
-| TEE 證明取值（一行替換點 ②） | `functions/agent/decide.js` | `extract_proof(response)`，第 141 行。目前讀 `X-Agent-Proof` header |
-| **印章在哪裡封出** | `functions/agent/decide.js` | `sealDecision()`，第 184 行：`proof_id = sha256(payload)[:16]`、`sig = HMAC-SHA256(OG_SEAL_SECRET, payload)`，`router_proof` 原文一併封入 |
-| **印章在哪裡驗證** | `functions/agent/verify.js` | `onRequestPost`：第 59 行重算 `proof_id`、第 63 行重算 `sig`、`verify_router_proof()` 第 93 行驗 TEE 證明（一行替換點） |
+| **真的打到 0G Compute Router 的那一行** | `functions/agent/decide.js` | `callRouter()` 內的 `fetch(url, …)`，第 132 行 → `https://router-api.0g.ai/v1/chat/completions`；模型 `0gm-1.0-35b-a3b`（Router 的 id，name 為 0GM-1.0-35B-A3B，TEE 型別 TDX）；請求帶 `verify_tee: true` |
+| Router 驗證標頭（一行替換點 ①） | `functions/agent/decide.js` | `sign_request()`，第 106 行。`Authorization: Bearer sk-…`；0G 文件明載不需 per-request 錢包簽名 |
+| TEE 證明取值（一行替換點 ②） | `functions/agent/decide.js` | `extract_proof(response, json)`，第 155 行。讀 `ZG-Res-Key` header（provider 的 response id）＋ body 的 `x_0g_trace.{request_id, provider, tee_verified}`，封成 JSON 字串進印章 |
+| **印章在哪裡封出** | `functions/agent/decide.js` | `sealDecision()`，第 205 行：`proof_id = sha256(payload)[:16]`、`sig = HMAC-SHA256(OG_SEAL_SECRET, payload)`，`router_proof` 原文一併封入 |
+| **印章在哪裡驗證** | `functions/agent/verify.js` | `onRequestPost`：第 59 行重算 `proof_id`、第 63 行重算 `sig`、`verify_router_proof()` 第 96 行檢查 `tee_verified === true` 且 provider 為合法鏈上地址 |
 | 現場驗證頁 | `public/verify.html` | 純靜態、無 build、無外部依賴，手機可開。貼印章或 `proof_id` → 逐章亮燈 |
 | 遊戲端 HTTP 封裝 | `app/godot/scripts/battle/agent_client.gd`（private repo） | `decide()` / `verify()`；逾時或非 2xx 回空 Dictionary |
 | 遊戲端接線 | `app/godot/scripts/battle/turn_battle.gd`（private repo） | 玩家回合開始就預取（第 4209 行）→ 敵方回合消費（第 5256 行）→ 印章標籤緊貼既有 `EnemyActionLabel`（`_og_proof_label`）→ 結算畫面「驗證這場戰鬥」（`_on_og_verify_pressed`） |
@@ -283,7 +283,9 @@ LLM 的幾秒延遲落在玩家思考技能的時間裡；敵方回合開始時�
   "v": 1, "agent_id": "<0G Agentic ID>", "model": "0GM-1.0-35B-A3B",
   "civilization": "sui", "turn": 3, "board_hash": "<sha256 of canonical board_state>",
   "action": "Heavy Strike", "target": "player", "intent_text": "先壓制對手的架式",
-  "chat_id": "<router response id>", "router_proof": "<TEE 證明原文>", "ts": 1788750736006,
+  "chat_id": "<router response id>",
+  "router_proof": "{\"res_key\":\"<ZG-Res-Key>\",\"request_id\":\"<x_0g_trace.request_id>\",\"provider\":\"0xd996…471C\",\"tee_verified\":true}",
+  "ts": 1788750736006,
   "proof_id": "c50cacf84a93d507", "sig": "<HMAC-SHA256 hex>"
 }
 ```
@@ -297,9 +299,8 @@ LLM 的幾秒延遲落在玩家思考技能的時間裡；敵方回合開始時�
 # 1. 起 Pages Functions（同源，不需 CORS）。沒有 mock Router 也能跑：decide 會回 fallback。
 cd play
 npx wrangler pages dev public --port 8788 \
-  --binding OG_API_KEY=<0G API key> \
-  --binding OG_ROUTER_URL=https://<workshop 公布的 router>/v1/chat/completions \
-  --binding OG_AGENT_ID=<0G Agentic ID> \
+  --binding OG_API_KEY=sk-<在 pc.0g.ai 建的 API key> \
+  --binding OG_AGENT_ID=<Agentic ID，格式 <ERC-7857 合約>:<tokenId>> \
   --binding OG_SEAL_SECRET=<隨機字串>
 
 # 2. 手動打一發
@@ -313,8 +314,8 @@ open http://localhost:8788/verify
 #    桌面版打 http://127.0.0.1:8788（agent_client.gd 頂端常數）；Web 版自動同源。
 ```
 
-環境變數（CF Pages 專案設定或 `--binding`）：`OG_API_KEY`（必要，未設即 fallback）、
-`OG_ROUTER_URL`（預設值在 `decide.js` 頂端）、`OG_MODEL`（預設 `0GM-1.0-35B-A3B`）、
+環境變數（CF Pages 專案設定或 `--binding`）：`OG_API_KEY`（必要，未設即 fallback；在 pc.0g.ai 連錢包、儲值、建 `sk-` key）、
+`OG_ROUTER_URL`（預設 `https://router-api.0g.ai/v1/chat/completions`）、`OG_MODEL`（預設 `0gm-1.0-35b-a3b`）、
 `OG_AGENT_ID`、`OG_SEAL_SECRET`（未設時用開發金鑰並在印章標 `dev_secret: true`）、
 `OG_TIMEOUT_MS`（預設 9000）、選配 KV 綁定 `AGENT_KV`（讓 `verify.html` 只貼 `proof_id` 也查得到）。
 
