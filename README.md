@@ -276,6 +276,23 @@ fully forward-compatible with the deployed mainnet package.
 **延遲藏在哪**：玩家回合一開始就向 `/agent/decide` 預取「下一回合」的指揮官決策，
 LLM 的幾秒延遲落在玩家思考技能的時間裡；敵方回合開始時直接消費結果。
 
+### Agentic ID（賽道 B：有身份的 Agent）
+
+指揮官的身份是一枚 ERC-7857 Agentic ID，mint 在 **0G Galileo 測試網**（chain id 16602）：
+
+| 項目 | 值 |
+|---|---|
+| AgenticID 合約 | [`0xC1Af70aB6Df042Ac0561e2758e2020B8caeE0d97`](https://chainscan-galileo.0g.ai/address/0xC1Af70aB6Df042Ac0561e2758e2020B8caeE0d97) |
+| tokenId | `1`，持有者 `0x2CfB6fDc9764035cBb3407087D10Ae13193aFCB9` |
+| 部署 tx | [`0x4c3f427f…4fc32a`](https://chainscan-galileo.0g.ai/tx/0x4c3f427f85f8f740479e8866fb1e8fc14085755fc9887599be5b10c1d44fc32a) |
+| mint tx | [`0x65940b5b…362b5c`](https://chainscan-galileo.0g.ai/tx/0x65940b5b5046d8524faad8d4b418317770d1294c9d369fc5ad3bd37d34362b5c) |
+| metadataHash | `0xbd196d21…205378` = sha256(指揮官 system prompt + 模型設定) |
+
+合約介面照 [0G Agentic ID 整合指南](https://docs.0g.ai/developer-hub/building-on-0g/agentic-id/integration)：
+`mint(recipient, encryptedURI, metadataHash)` / `ownerOf` / `getMetadataHash` / `getEncryptedURI`。
+每一枚印章的 `agent_id` 欄位就是 `<合約>:<tokenId>`，由 `OG_AGENT_ID` 環境變數注入，
+驗章時 `details.agent_id` 會回顯，評審可對照鏈上 `ownerOf(1)`。
+
 ### 印章長什麼樣
 
 ```json
