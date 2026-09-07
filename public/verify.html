@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ConSSS Wars · 0G 印章驗證</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0e0f14; color: #e8e8f0; font: 16px/1.5 -apple-system, "Noto Sans TC", system-ui, sans-serif; }
+  main { max-width: 720px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; color: #e8d89a; }
+  p.sub { margin: 0 0 20px; color: #a9acb8; font-size: 14px; }
+  textarea { width: 100%; box-sizing: border-box; min-height: 180px; background: #161821; color: #e8e8f0; border: 1px solid #2c2f3d; border-radius: 8px; padding: 12px; font: 13px/1.4 ui-monospace, Menlo, monospace; resize: vertical; }
+  .row { display: flex; gap: 8px; margin: 12px 0 20px; flex-wrap: wrap; }
+  button { background: #3a5cff; color: #fff; border: 0; border-radius: 8px; padding: 12px 18px; font-size: 16px; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.ghost { background: #232636; }
+  .seal { border: 1px solid #2c2f3d; border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; background: #13151d; }
+  .seal.ok { border-color: #2f8f5b; }
+  .seal.bad { border-color: #a83a3a; }
+  .seal.pending { border-color: #5a5f78; }
+  .head { display: flex; align-items: center; gap: 10px; font-weight: 600; }
+  .lamp { width: 12px; height: 12px; border-radius: 50%; background: #5a5f78; flex: 0 0 auto; }
+  .ok .lamp { background: #37d67a; box-shadow: 0 0 10px #37d67a; }
+  .bad .lamp { background: #ff5c5c; box-shadow: 0 0 10px #ff5c5c; }
+  .meta { color: #a9acb8; font-size: 13px; margin-top: 4px; word-break: break-all; }
+  ul.checks { list-style: none; padding: 0; margin: 8px 0 0; font-size: 13px; }
+  ul.checks li { display: flex; gap: 8px; }
+  ul.checks li::before { content: "·"; color: #5a5f78; }
+  .pass { color: #37d67a; } .fail { color: #ff5c5c; } .skip { color: #a9acb8; }
+  .hint { color: #a9acb8; font-size: 13px; }
+  code { font: 12px ui-monospace, Menlo, monospace; background: #1c1f2b; padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>0G 指揮官印章驗證</h1>
+  <p class="sub">貼入一枚或多枚 X-Agent-Proof 印章（JSON 物件、JSON 陣列、或一行一個 <code>proof_id</code>），逐章呼叫 <code>/agent/verify</code> 離線驗證。</p>
+
+  <textarea id="input" placeholder='{"proof_id":"…","sig":"…", …}
+或
+["…第一枚…", "…第二枚…"]
+或
+a1b2c3d4e5f60718'></textarea>
+  <div class="row">
+    <button id="run">驗證</button>
+    <button id="clear" class="ghost">清空</button>
+  </div>
+  <div id="out"></div>
+  <p class="hint" id="hint"></p>
+</main>
+
+<script>
+(function () {
+  var input = document.getElementById('input');
+  var out = document.getElementById('out');
+  var hint = document.getElementById('hint');
+  var runBtn = document.getElementById('run');
+
+  // 若網址帶 ?proof_id=…，自動填入並開始驗證（手機掃碼／分享連結用）。
+  var qs = new URLSearchParams(location.search);
+  if (qs.get('proof_id')) { input.value = qs.get('proof_id'); setTimeout(run, 0); }
+
+  document.getElementById('clear').onclick = function () { input.value = ''; out.innerHTML = ''; hint.textContent = ''; };
+  runBtn.onclick = run;
+
+  // 把輸入解析成「待驗證項目」陣列：每項是 { proof } 或 { proof_id }
+  function parseInput(text) {
+    var t = text.trim();
+    if (!t) return [];
+    try {
+      var j = JSON.parse(t);
+      if (Array.isArray(j)) return j.map(toItem);
+      return [toItem(j)];
+    } catch (_) {}
+    // 非 JSON：視為一行一個 proof_id（或 8 碼以上的 hash 前綴）
+    return t.split(/\s+/).filter(Boolean).map(function (id) { return { proof_id: id }; });
+  }
+  function toItem(v) {
+    if (typeof v === 'string') return { proof_id: v };
+    if (v && typeof v === 'object') {
+      if (v.proof && typeof v.proof === 'object') return { proof: v.proof };
+      if (v.sig || v.board_hash) return { proof: v };
+      if (v.proof_id) return { proof_id: String(v.proof_id) };
+    }
+    return { proof: v };
+  }
+
+  function label(item, i) {
+    var p = item.proof || {};
+    var id = p.proof_id || item.proof_id || '';
+    var parts = ['第 ' + (i + 1) + ' 枚'];
+    if (p.turn) parts.push('回合 ' + p.turn);
+    if (p.action) parts.push(p.action);
+    if (id) parts.push(String(id).slice(0, 8));
+    return parts.join(' · ');
+  }
+
+  function render(items, results) {
+    out.innerHTML = '';
+    items.forEach(function (item, i) {
+      var r = results[i];
+      var div = document.createElement('div');
+      var cls = 'seal ' + (r == null ? 'pending' : (r.valid ? 'ok' : 'bad'));
+      div.className = cls;
+      var head = document.createElement('div');
+      head.className = 'head';
+      head.innerHTML = '<span class="lamp"></span><span></span>';
+      head.lastChild.textContent = label(item, i) + (r == null ? '　驗證中…' : (r.valid ? '　✔ 通過' : '　✘ 失敗'));
+      div.appendChild(head);
+      var p = item.proof || {};
+      if (p.intent_text) { var m = document.createElement('div'); m.className = 'meta'; m.textContent = '「' + p.intent_text + '」'; div.appendChild(m); }
+      if (r && r.details) {
+        var d = r.details;
+        var ul = document.createElement('ul'); ul.className = 'checks';
+        if (d.error) { ul.appendChild(li('錯誤：' + d.error, 'fail')); }
+        else {
+          ul.appendChild(li('印章形狀', d.shape));
+          ul.appendChild(li('proof_id 與內容一致（sha256）', d.proof_id_match));
+          ul.appendChild(li('封章簽名（HMAC-SHA256）' + (d.dev_secret ? '（開發金鑰）' : ''), d.sig_match));
+          if (d.router_proof_present) ul.appendChild(li('0G TEE 證明', d.router_proof_valid));
+          else ul.appendChild(li('0G TEE 證明：本枚未附（Router 未回傳 header）', null));
+          if (d.agent_id) ul.appendChild(li('Agentic ID：' + d.agent_id, null));
+          if (d.model) ul.appendChild(li('模型：' + d.model, null));
+          if (d.sealed_at) ul.appendChild(li('封章時間：' + d.sealed_at, null));
+        }
+        div.appendChild(ul);
+      }
+      out.appendChild(div);
+    });
+  }
+  function li(text, pass) {
+    var el = document.createElement('li');
+    el.className = pass === null ? 'skip' : (pass ? 'pass' : 'fail');
+    el.textContent = (pass === null ? '' : (pass ? '✔ ' : '✘ ')) + text;
+    return el;
+  }
+
+  function run() {
+    var items = parseInput(input.value);
+    if (!items.length) { hint.textContent = '請先貼入印章或 proof_id。'; return; }
+    runBtn.disabled = true;
+    hint.textContent = '';
+    var results = new Array(items.length).fill(null);
+    render(items, results);
+    var chain = Promise.resolve();
+    items.forEach(function (item, i) {
+      chain = chain.then(function () {
+        return fetch('/agent/verify', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(item),
+        }).then(function (r) { return r.json(); })
+          .catch(function (e) { return { valid: false, details: { error: '無法連線：' + e } }; })
+          .then(function (r) { results[i] = r; render(items, results); });
+      });
+    });
+    chain.then(function () {
+      var ok = results.filter(function (r) { return r && r.valid; }).length;
+      hint.textContent = ok + ' / ' + items.length + ' 枚印章通過驗證。';
+      runBtn.disabled = false;
+    });
+  }
+})();
+</script>
+</body>
+</html>

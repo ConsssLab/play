@@ -245,6 +245,91 @@ client-trusted, in two layers:
 the **backend's decision to sign** gets stricter. That keeps this upgrade path
 fully forward-compatible with the deployed mainnet package.
 
+## 0G Taipei Hackathon — 可驗證的敵方指揮官 Agent（hack/0g 分支）
+
+> 賽道 A（可驗證推理）＋ B（有身份的 Agent）。把《鏈之迴響》關卡裡腳本化的敵方
+> AI，換成一個持有 **0G Agentic ID** 的指揮官 Agent：它每回合的決策都經由
+> **0G Compute Router**（模型 `0GM-1.0-35B-A3B`）推理，並封成一枚
+> **X-Agent-Proof 印章**；戰鬥結束時玩家可以當場逐章驗證。
+>
+> **為什麼要做**：目前鏈上戰績靠我方伺服器自簽的 ed25519 voucher 才發得出去，
+> 玩家必須先相信 ConSSS 沒作弊。換成 TEE 簽出的章之後，「AI 判了什麼」變成
+> 任何人都能獨立驗證的事實，不需要相信我們。
+
+### 整合點（評審請看這裡）
+
+| 事情 | 檔案 | 位置 |
+|---|---|---|
+| **真的打到 0G Compute Router 的那一行** | `functions/agent/decide.js` | `callRouter()` 內的 `fetch(url, …)`，第 122 行；模型常數 `OG_MODEL = '0GM-1.0-35B-A3B'` |
+| Router 驗證標頭（一行替換點 ①） | `functions/agent/decide.js` | `sign_request()`，第 101 行。目前 `Authorization: Bearer`，並帶 `x-agent-id`（Agentic ID）。需錢包簽名時只改這裡 |
+| TEE 證明取值（一行替換點 ②） | `functions/agent/decide.js` | `extract_proof(response)`，第 141 行。目前讀 `X-Agent-Proof` header |
+| **印章在哪裡封出** | `functions/agent/decide.js` | `sealDecision()`，第 184 行：`proof_id = sha256(payload)[:16]`、`sig = HMAC-SHA256(OG_SEAL_SECRET, payload)`，`router_proof` 原文一併封入 |
+| **印章在哪裡驗證** | `functions/agent/verify.js` | `onRequestPost`：第 59 行重算 `proof_id`、第 63 行重算 `sig`、`verify_router_proof()` 第 93 行驗 TEE 證明（一行替換點） |
+| 現場驗證頁 | `public/verify.html` | 純靜態、無 build、無外部依賴，手機可開。貼印章或 `proof_id` → 逐章亮燈 |
+| 遊戲端 HTTP 封裝 | `app/godot/scripts/battle/agent_client.gd`（private repo） | `decide()` / `verify()`；逾時或非 2xx 回空 Dictionary |
+| 遊戲端接線 | `app/godot/scripts/battle/turn_battle.gd`（private repo） | 玩家回合開始就預取（第 4209 行）→ 敵方回合消費（第 5256 行）→ 印章標籤緊貼既有 `EnemyActionLabel`（`_og_proof_label`）→ 結算畫面「驗證這場戰鬥」（`_on_og_verify_pressed`） |
+
+**回退哲學（沿用 `backend/src/llm.mjs`）**：key 未設、逾時、非 2xx、回覆解析失敗、
+行動不在合法池內 —— `/agent/decide` 一律回 **HTTP 200 + `{ fallback: true }`**，
+遊戲端退回既有的確定性 simple AI。網路完全拔掉，戰鬥照樣能打完。
+
+**延遲藏在哪**：玩家回合一開始就向 `/agent/decide` 預取「下一回合」的指揮官決策，
+LLM 的幾秒延遲落在玩家思考技能的時間裡；敵方回合開始時直接消費結果。
+
+### 印章長什麼樣
+
+```json
+{
+  "v": 1, "agent_id": "<0G Agentic ID>", "model": "0GM-1.0-35B-A3B",
+  "civilization": "sui", "turn": 3, "board_hash": "<sha256 of canonical board_state>",
+  "action": "Heavy Strike", "target": "player", "intent_text": "先壓制對手的架式",
+  "chat_id": "<router response id>", "router_proof": "<TEE 證明原文>", "ts": 1788750736006,
+  "proof_id": "c50cacf84a93d507", "sig": "<HMAC-SHA256 hex>"
+}
+```
+
+`verify.js` 逐項回報：`shape` / `proof_id_match` / `sig_match` / `router_proof_valid`。
+任何一個欄位被改（例如把 `action` 改掉），`proof_id_match` 與 `sig_match` 立刻變 `false`。
+
+### 本機執行
+
+```bash
+# 1. 起 Pages Functions（同源，不需 CORS）。沒有 mock Router 也能跑：decide 會回 fallback。
+cd play
+npx wrangler pages dev public --port 8788 \
+  --binding OG_API_KEY=<0G API key> \
+  --binding OG_ROUTER_URL=https://<workshop 公布的 router>/v1/chat/completions \
+  --binding OG_AGENT_ID=<0G Agentic ID> \
+  --binding OG_SEAL_SECRET=<隨機字串>
+
+# 2. 手動打一發
+curl -s -X POST localhost:8788/agent/decide -H 'content-type: application/json' \
+  -d '{"civilization":"sui","turn":3,"board_state":{"valid_actions":["Arc Slash","Heavy Strike"]}}'
+
+# 3. 驗證頁
+open http://localhost:8788/verify
+
+# 4. 遊戲端：在 Godot 4.6 開 ../app/godot，切到 hack/0g 分支，直接跑任一關的 Boss 戰。
+#    桌面版打 http://127.0.0.1:8788（agent_client.gd 頂端常數）；Web 版自動同源。
+```
+
+環境變數（CF Pages 專案設定或 `--binding`）：`OG_API_KEY`（必要，未設即 fallback）、
+`OG_ROUTER_URL`（預設值在 `decide.js` 頂端）、`OG_MODEL`（預設 `0GM-1.0-35B-A3B`）、
+`OG_AGENT_ID`、`OG_SEAL_SECRET`（未設時用開發金鑰並在印章標 `dev_secret: true`）、
+`OG_TIMEOUT_MS`（預設 9000）、選配 KV 綁定 `AGENT_KV`（讓 `verify.html` 只貼 `proof_id` 也查得到）。
+
+### Preview URL
+
+部署到 Cloudflare Pages 的 **preview 分支**，不動正式站：
+
+```bash
+npx wrangler pages deploy public --project-name consss-play --branch hack-0g
+```
+
+- 遊戲：`https://hack-0g.consss-play.pages.dev/`
+- 驗證頁：`https://hack-0g.consss-play.pages.dev/verify`
+- 端點：`POST /agent/decide`、`POST /agent/verify`
+
 ## Local development
 
 Prerequisites: Node 18+ and (for serving Functions locally) `wrangler`.
