@@ -1,11 +1,11 @@
 // Cloudflare Pages Function — POST /agent/decide
 //
-// 0G 指揮官 Agent 的單回合決策端點。
+// 0G 指揮官 Agent 的單回合決策端點（多 Agent 協作：偵察官 → 指揮官，每跳出章）。
 //   收：{ civilization, board_state, turn }
-//   → 以模型 0GM-1.0-35B-A3B 呼叫 0G Compute Router（真的發出 API 請求）
-//   → parseJsonLoose 解出行動物件
-//   → extract_proof() 取得 TEE 證明，並封成一枚 X-Agent-Proof 印章
-//   回：{ action, intent_text, proof, proof_id }
+//   → 偵察官 Agent：以 0GM-1.0-35B-A3B 讀盤面，產出一句戰況簡報 → 封第 1 枚章
+//   → 指揮官 Agent：讀盤面 + 偵察簡報，決定行動 → 封第 2 枚章（parent = 偵察章的 proof_id）
+//   回：{ action, intent_text, proof, proof_id, scout: { brief, proof_id }, proofs: [偵察章, 指揮章] }
+//   偵察官逾時或失敗時，指揮官單獨決策（proofs 只有一枚），遊戲照樣能跑。
 //
 // 哲學（沿用 backend/src/llm.mjs）：key 未設、逾時、非 2xx、解析失敗，
 // 一律回 HTTP 200 + { fallback: true }，讓遊戲端退回既有的確定性 simple AI。
@@ -30,7 +30,8 @@ const OG_MODEL = '0gm-1.0-35b-a3b';
 //   回應 header ZG-Res-Key 帶 provider 的 response id（chatID），可對 provider 再驗一次。
 const OG_PROOF_HEADER = 'ZG-Res-Key';
 
-const DEFAULT_TIMEOUT_MS = 9000;
+const DEFAULT_TIMEOUT_MS = 7000;   // 單次 Router 呼叫；兩跳合計仍在遊戲端 14 秒逾時內
+const SCOUT_TIMEOUT_MS = 5000;     // 偵察官逾時就跳過，指揮官單獨決策
 // OG_SEAL_SECRET 未設時的本機開發用金鑰；verify.js 使用同一個常數，
 // 印章的 details.dev_secret 會標明 true，評審一眼可辨。
 const DEV_SEAL_SECRET = 'consss-0g-dev-seal';
@@ -53,7 +54,28 @@ export async function onRequestPost(context) {
   }
 
   try {
-    const messages = buildMessages(civilization, board, turn, validActions);
+    // ── 第 1 跳：偵察官 Agent（失敗就略過，不影響指揮官）──
+    let scout = null;
+    try {
+      const sr = await callRouter(env, buildScoutMessages(civilization, board, turn, validActions), SCOUT_TIMEOUT_MS);
+      const sp = parseJsonLoose(sr.text);
+      const brief = sp && typeof sp === 'object' ? String(sp.brief || '').trim().slice(0, 120) : '';
+      if (brief) {
+        const scoutProof = await sealDecision(env, {
+          role: 'scout', parent: null,
+          civilization, turn, board,
+          action: { name: String(sp.recommend || ''), target: 'player' },
+          intentText: brief,
+          routerProof: extract_proof(sr.response, sr.json), chatId: sr.chatId,
+        });
+        scout = { brief, recommend: String(sp.recommend || ''), proof: scoutProof, proof_id: scoutProof.proof_id };
+      }
+    } catch (_) {
+      scout = null;
+    }
+
+    // ── 第 2 跳：指揮官 Agent ──
+    const messages = buildMessages(civilization, board, turn, validActions, scout ? scout.brief : '');
     const { text, response, json, chatId } = await callRouter(env, messages);
     const parsed = parseJsonLoose(text);
     if (!parsed || typeof parsed !== 'object') {
@@ -71,12 +93,16 @@ export async function onRequestPost(context) {
 
     const routerProof = extract_proof(response, json);
     const proof = await sealDecision(env, {
+      role: 'commander', parent: scout ? scout.proof_id : null,
       civilization, turn, board, action, intentText, routerProof, chatId,
     });
 
+    const proofs = scout ? [scout.proof, proof] : [proof];
     // 有綁 AGENT_KV 就順手存一份，讓 verify.html 只貼 proof_id 也查得到；沒綁就略過。
     if (env.AGENT_KV) {
-      context.waitUntil(env.AGENT_KV.put(`seal:${proof.proof_id}`, JSON.stringify(proof), { expirationTtl: 7 * 24 * 3600 }));
+      for (const p of proofs) {
+        context.waitUntil(env.AGENT_KV.put(`seal:${p.proof_id}`, JSON.stringify(p), { expirationTtl: 7 * 24 * 3600 }));
+      }
     }
 
     return jsonOut({
@@ -84,6 +110,8 @@ export async function onRequestPost(context) {
       intent_text: intentText,
       proof,
       proof_id: proof.proof_id,
+      scout: scout ? { brief: scout.brief, recommend: scout.recommend, proof_id: scout.proof_id } : null,
+      proofs,
     });
   } catch (e) {
     return jsonOut({ fallback: true, reason: String((e && e.message) || e) });
@@ -112,10 +140,10 @@ async function sign_request(env, _bodyText) {
   return headers;
 }
 
-async function callRouter(env, messages) {
+async function callRouter(env, messages, timeoutMs) {
   const url = env.OG_ROUTER_URL || OG_ROUTER_URL_DEFAULT;
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), Number(env.OG_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS);
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs || Number(env.OG_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS);
   try {
     const bodyText = JSON.stringify({
       model: env.OG_MODEL || OG_MODEL,
@@ -164,10 +192,26 @@ function extract_proof(response, json) {
   });
 }
 
-function buildMessages(civilization, board, turn, validActions) {
+// 偵察官 Agent：只讀盤面、不下決定，產出一句戰況簡報與建議行動，交給指揮官。
+function buildScoutMessages(civilization, board, turn, validActions) {
+  const system = [
+    '你是《鏈之迴響》敵方陣營的偵察官 Agent，負責替指揮官分析戰況。',
+    '根據 board_state 判斷：玩家血量與架式（stance）、我方 Boss 血量與架式、回合壓力。',
+    '只回傳一個 JSON 物件，不要多餘文字：',
+    '{"brief":"<一句 40 字內的戰況簡報，繁體中文>","recommend":"<valid_actions 之一，原字串>"}',
+  ].join('\n');
+  const user = JSON.stringify({ civilization, turn, board_state: board, valid_actions: validActions });
+  return [
+    { role: 'system', content: system },
+    { role: 'user', content: user },
+  ];
+}
+
+// 指揮官 Agent：讀盤面與偵察簡報，做最終決定。
+function buildMessages(civilization, board, turn, validActions, scoutBrief) {
   const system = [
     '你是《鏈之迴響》裡持有 0G Agentic ID 的敵方指揮官。',
-    '每回合根據戰況，從 valid_actions 中「只能」挑一個行動。',
+    '每回合根據戰況與偵察官的簡報，從 valid_actions 中「只能」挑一個行動；偵察簡報只是參考，可以不採納。',
     '只回傳一個 JSON 物件，不要多餘文字：',
     '{"action":"<valid_actions 之一，原字串>","target":"player","intent_text":"<一句 30 字內的戰術意圖，繁體中文>"}',
   ].join('\n');
@@ -176,6 +220,7 @@ function buildMessages(civilization, board, turn, validActions) {
     turn,
     board_state: board,
     valid_actions: validActions,
+    scout_brief: scoutBrief || null,
   });
   return [
     { role: 'system', content: system },
@@ -186,8 +231,20 @@ function buildMessages(civilization, board, turn, validActions) {
 // ── 印章 ──────────────────────────────────────────────────────────────
 // 正規化欄位：鍵名固定排序、值皆為字串／數字，兩端計算出的 bytes 才會一致。
 export function buildSealPayload(p) {
+  const v = Number(p.v) || 1;
+  if (v === 1) {
+    return JSON.stringify({
+      v: 1,
+      agent_id: p.agent_id, model: p.model, civilization: p.civilization, turn: p.turn,
+      board_hash: p.board_hash, action: p.action, target: p.target, intent_text: p.intent_text,
+      chat_id: p.chat_id, router_proof: p.router_proof, ts: p.ts,
+    });
+  }
+  // v2：多 Agent 每跳出章 —— role 標明是哪個 Agent，parent 指向上一跳的 proof_id，串成證明鏈。
   return JSON.stringify({
-    v: 1,
+    v: 2,
+    role: p.role,
+    parent: p.parent,
     agent_id: p.agent_id,
     model: p.model,
     civilization: p.civilization,
@@ -202,8 +259,11 @@ export function buildSealPayload(p) {
   });
 }
 
-async function sealDecision(env, { civilization, turn, board, action, intentText, routerProof, chatId }) {
+async function sealDecision(env, { role, parent, civilization, turn, board, action, intentText, routerProof, chatId }) {
   const fields = {
+    v: 2,
+    role: role || 'commander',
+    parent: parent || null,
     agent_id: String(env.OG_AGENT_ID || 'unregistered'),
     model: String(env.OG_MODEL || OG_MODEL),
     civilization,

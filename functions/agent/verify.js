@@ -42,6 +42,9 @@ export async function onRequestPost(context) {
       && typeof proof.proof_id === 'string' && proof.proof_id.length === 16;
 
     const payload = buildSealPayload({
+      v: proof.v || 1,
+      role: proof.role,
+      parent: proof.parent === undefined ? null : proof.parent,
       agent_id: proof.agent_id,
       model: proof.model,
       civilization: proof.civilization,
@@ -66,6 +69,8 @@ export async function onRequestPost(context) {
     details.router_proof_present = Boolean(proof.router_proof);
     details.router_proof_valid = await verify_router_proof(proof.router_proof, payload, env);
 
+    details.role = proof.role || 'commander';
+    details.parent = proof.parent || null;
     details.agent_id = proof.agent_id || null;
     details.model = proof.model || null;
     details.turn = proof.turn;

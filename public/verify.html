@@ -101,6 +101,7 @@ a1b2c3d4e5f60718'></textarea>
     var p = item.proof || {};
     var id = p.proof_id || item.proof_id || '';
     var parts = ['第 ' + (i + 1) + ' 枚'];
+    if (p.role) parts.push(p.role === 'scout' ? '偵察官' : '指揮官');
     if (p.turn) parts.push('回合 ' + p.turn);
     if (p.action) parts.push(p.action);
     if (id) parts.push(String(id).slice(0, 8));
@@ -131,6 +132,7 @@ a1b2c3d4e5f60718'></textarea>
           ul.appendChild(li('封章簽名（HMAC-SHA256）' + (d.dev_secret ? '（開發金鑰）' : ''), d.sig_match));
           if (d.router_proof_present) ul.appendChild(li('0G TEE 證明', d.router_proof_valid));
           else ul.appendChild(li('0G TEE 證明：本枚未附（Router 未回傳 header）', null));
+          if (d.parent) ul.appendChild(li('證明鏈：承接偵察章 ' + String(d.parent).slice(0, 8), null));
           if (d.agent_id) ul.appendChild(li('Agentic ID：' + d.agent_id, null));
           if (d.model) ul.appendChild(li('模型：' + d.model, null));
           if (d.sealed_at) ul.appendChild(li('封章時間：' + d.sealed_at, null));
