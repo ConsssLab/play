@@ -37,28 +37,30 @@
 
   <section>
     <h2>架構是什麼</h2>
-    <p>Godot 遊戲端在玩家回合開始就預取指揮官決策（把 LLM 延遲藏進玩家思考時間）→ Cloudflare Pages Function <code>/agent/decide</code> 打 0G Router（<code>0gm-1.0-35b-a3b</code>、<code>verify_tee: true</code>）→ 把 <code>x_0g_trace.tee_verified</code>、provider 地址與 Agentic ID 封成印章（sha256 ＋ HMAC）→ <code>/agent/verify</code> 與 <code>/verify</code> 頁面離線逐章驗證。</p>
+    <p>Godot 遊戲端在玩家回合開始就預取決策（把 LLM 延遲藏進玩家思考時間）→ <code>/agent/decide</code> 跑兩個 Agent：偵察官讀盤面出簡報、指揮官做決定，兩跳都經 0G Router（<code>0gm-1.0-35b-a3b</code>、<code>verify_tee</code>）並各封一枚章串成證明鏈 → 每枚章由 Agentic ID 持有者錢包 EIP-191 簽名，並封入 provider 在 TEE 內的簽名 → <code>/verify</code> 頁 ecrecover 對照鏈上 ERC-7857 與 ERC-8004 的 ownerOf，離線、免 gas。</p>
   </section>
 
   <section>
     <h2>Why build on 0G</h2>
-    <p>只有 0G 同時給我們「一行 base_url 就能用的 OpenAI 相容 Router」、「TDX TEE 硬體證明的推理」與「ERC-7857 的 Agent 鏈上身份」，讓遊戲 AI 的每個判斷都能歸責到一個有身份、有證明的 Agent。</p>
+    <p>只有 0G 同時給我們「一行 base_url 就能用的 OpenAI 相容 Router」、「TDX TEE 硬體簽名的推理」與「ERC-7857 ＋ 官方 ERC-8004 的 Agent 鏈上身份」，讓遊戲 AI 的每個判斷都能歸責到一個有身份、有證明的 Agent。</p>
   </section>
 
   <section>
     <h2>Demo 完成了什麼</h2>
-    <p>本機打完一場 Boss 戰，每回合的指揮官思路與印章 hash 顯示在預告 UI 上，結算按「驗證這場戰鬥」逐章亮綠；印章帶真實的 <code>tee_verified: true</code> 與鏈上 Agentic ID <code>0xC1Af…0d97:1</code>，網路拔掉時遊戲仍能用確定性 AI 打完。</p>
+    <p>本機打完一場 Boss 戰，每回合偵察簡報、指揮官思路與印章 hash 顯示在預告 UI，結算一鍵開瀏覽器逐章亮綠；每枚章帶真實的 <code>tee_verified: true</code>、provider TEE 簽名、ERC-7857 Agentic ID <code>0xC1Af…0d97:1</code> 與 ERC-8004 agentId <code>396</code>；網路拔掉時遊戲仍能用確定性 AI 打完。</p>
   </section>
 
   <section>
     <h2>未來 Roadmap</h2>
-    <p>把印章從「AI 判斷可驗證」延伸到「整場戰鬥可驗證」：server 重播或 zk-proof 驗證結算公式、用 <code>ZG-Res-Key</code> 向 provider 二次核對 TEE 簽名、印章寫進 0G 鏈成為 On-Chain Agent（賽道 C）、Agentic ID 的智慧內容改存 0G Storage 加密 blob。</p>
+    <p>把印章從「AI 判斷可驗證」延伸到「整場戰鬥可驗證」：server 重播或 zk-proof 驗證結算公式、每場戰鬥的印章 Merkle root 寫進 ERC-8004 Reputation Registry 成為 On-Chain Agent（賽道 C）、Agentic ID 的智慧內容改存 0G Storage 加密 blob。</p>
   </section>
 
   <div class="links">
     <a href="https://github.com/ConsssLab/play/tree/hack/0g">GitHub repo（hack/0g）</a>
     <a href="https://github.com/ConsssLab/play/tree/hack/0g/agentic-id">Agentic ID 合約</a>
-    <a href="https://chainscan-galileo.0g.ai/address/0xC1Af70aB6Df042Ac0561e2758e2020B8caeE0d97">鏈上 Agentic ID</a>
+    <a href="https://chainscan-galileo.0g.ai/address/0xC1Af70aB6Df042Ac0561e2758e2020B8caeE0d97">鏈上 Agentic ID（ERC-7857）</a>
+    <a href="https://chainscan-galileo.0g.ai/tx/0xa1cb137353bf0ae671beaa5812ea11b485cf3370bdc860e16d85aa274b3f6145">ERC-8004 註冊（agentId 396）</a>
+    <a href="/agent-card.json">Agent 卡片</a>
     <a href="/verify">現場驗證頁</a>
   </div>
 

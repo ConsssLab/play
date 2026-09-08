@@ -25,3 +25,6 @@ public/dist/
 
 # 黑客松 pitch 筆記（本機私人）
 20260907_0G_pitch.md
+
+# wrangler 本機 secrets（0G key / 簽章私鑰），絕不進 git
+.dev.vars

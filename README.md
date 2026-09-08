@@ -262,11 +262,13 @@ fully forward-compatible with the deployed mainnet package.
 
 | 事情 | 檔案 | 位置 |
 |---|---|---|
-| **真的打到 0G Compute Router 的那一行** | `functions/agent/decide.js` | `callRouter()` 內的 `fetch(url, …)`，第 132 行 → `https://router-api.0g.ai/v1/chat/completions`；模型 `0gm-1.0-35b-a3b`（Router 的 id，name 為 0GM-1.0-35B-A3B，TEE 型別 TDX）；請求帶 `verify_tee: true` |
-| Router 驗證標頭（一行替換點 ①） | `functions/agent/decide.js` | `sign_request()`，第 106 行。`Authorization: Bearer sk-…`；0G 文件明載不需 per-request 錢包簽名 |
-| TEE 證明取值（一行替換點 ②） | `functions/agent/decide.js` | `extract_proof(response, json)`，第 155 行。讀 `ZG-Res-Key` header（provider 的 response id）＋ body 的 `x_0g_trace.{request_id, provider, tee_verified}`，封成 JSON 字串進印章 |
-| **印章在哪裡封出** | `functions/agent/decide.js` | `sealDecision()`，第 205 行：`proof_id = sha256(payload)[:16]`、`sig = HMAC-SHA256(OG_SEAL_SECRET, payload)`，`router_proof` 原文一併封入 |
-| **印章在哪裡驗證** | `functions/agent/verify.js` | `onRequestPost`：第 59 行重算 `proof_id`、第 63 行重算 `sig`、`verify_router_proof()` 第 96 行檢查 `tee_verified === true` 且 provider 為合法鏈上地址 |
+| **真的打到 0G Compute Router 的那一行** | `functions/agent/decide.js` | `callRouter()` 內的 `fetch(url, …)` → `https://router-api.0g.ai/v1/chat/completions`；模型 `0gm-1.0-35b-a3b`（Router 的 id，name 為 0GM-1.0-35B-A3B，TEE 型別 TDX）；請求帶 `verify_tee: true` |
+| Router 驗證標頭（一行替換點 ①） | `functions/agent/decide.js` | `sign_request()`。`Authorization: Bearer sk-…`；0G 文件明載不需 per-request 錢包簽名 |
+| **多 Agent 協作（每跳出章）** | `functions/agent/decide.js` | `onRequestPost`：偵察官 Agent（`buildScoutMessages`）→ 指揮官 Agent（`buildMessages`），兩跳都走 0G Router；指揮章的 `parent` = 偵察章 `proof_id`，串成證明鏈 |
+| **ERC-8004 身份** | `public/agent-card.json` | 官方 Identity Registry（Galileo `0x8004A818…BD9e`）agentId **396**，agentURI 指向這份 registration-v1 卡片；每枚印章帶 `erc8004_agent_id` |
+| TEE 證明取值（一行替換點 ②） | `functions/agent/decide.js` | `extract_proof()`。讀 `ZG-Res-Key` header ＋ `x_0g_trace.{request_id, provider, tee_verified}`，再向 provider 本人取 EIP-191 簽名 `{text, signature}` 與 `teeSignerAddress`，封成 JSON 字串進印章 |
+| **印章在哪裡封出** | `functions/agent/decide.js` | `sealDecision()`：`proof_id = sha256(payload)[:16]`、`sig = EIP-191 personal_sign(payload)` by Agentic ID 持有者錢包（`eip191Sign()`，secp256k1）；`extract_proof()` 依官方 Verifiable Execution 流程向 provider 取 TEE 簽名（`getService` → `/v1/proxy/signature/{chatID}`）一併封入 |
+| **印章在哪裡驗證** | `functions/agent/verify.js` | `onRequestPost`：重算 `proof_id`；`eip191Recover()` 還原簽名者並對照鏈上 ERC-7857 `ownerOf(1)` 與 ERC-8004 `ownerOf(396)`（Galileo eth_call）；`verify_router_proof()` 檢查 `tee_verified` 且 provider TEE 簽名 ecrecover == `teeSignerAddress` |
 | 現場驗證頁 | `public/verify.html` | 純靜態、無 build、無外部依賴，手機可開。貼印章或 `proof_id` → 逐章亮燈 |
 | 遊戲端 HTTP 封裝 | `app/godot/scripts/battle/agent_client.gd`（private repo） | `decide()` / `verify()`；逾時或非 2xx 回空 Dictionary |
 | 遊戲端接線 | `app/godot/scripts/battle/turn_battle.gd`（private repo） | 玩家回合開始就預取（第 4209 行）→ 敵方回合消費（第 5256 行）→ 印章標籤緊貼既有 `EnemyActionLabel`（`_og_proof_label`）→ 結算畫面「驗證這場戰鬥」（`_on_og_verify_pressed`） |
@@ -289,11 +291,23 @@ LLM 的幾秒延遲落在玩家思考技能的時間裡；敵方回合開始時�
 | 部署 tx | [`0x4c3f427f…4fc32a`](https://chainscan-galileo.0g.ai/tx/0x4c3f427f85f8f740479e8866fb1e8fc14085755fc9887599be5b10c1d44fc32a) |
 | mint tx | [`0x65940b5b…362b5c`](https://chainscan-galileo.0g.ai/tx/0x65940b5b5046d8524faad8d4b418317770d1294c9d369fc5ad3bd37d34362b5c) |
 | metadataHash | `0xbd196d21…205378` = sha256(指揮官 system prompt + 模型設定) |
+| **ERC-8004 Identity Registry**（0G 官方） | Galileo `0x8004A818BFB912233c491871b3d84c89A494BD9e`，agentId **396**，[註冊 tx `0xa1cb1373…3f6145`](https://chainscan-galileo.0g.ai/tx/0xa1cb137353bf0ae671beaa5812ea11b485cf3370bdc860e16d85aa274b3f6145)，agentURI → [`/agent-card.json`](https://0g.conssswars.com/agent-card.json) |
 
 合約介面照 [0G Agentic ID 整合指南](https://docs.0g.ai/developer-hub/building-on-0g/agentic-id/integration)：
 `mint(recipient, encryptedURI, metadataHash)` / `ownerOf` / `getMetadataHash` / `getEncryptedURI`。
 每一枚印章的 `agent_id` 欄位就是 `<合約>:<tokenId>`，由 `OG_AGENT_ID` 環境變數注入，
 驗章時 `details.agent_id` 會回顯，評審可對照鏈上 `ownerOf(1)`。
+
+### X-Agent-Proof 印章的簽章方式（v3）
+
+- **誰簽**：Agentic ID 持有者錢包 `0x2CfB…FCB9` 以 **EIP-191 `personal_sign`（secp256k1）** 對正規化 payload 簽名。
+  驗證器 `ecrecover` 出簽名者後，對照鏈上 ERC-7857 `ownerOf(1)` 與 ERC-8004 `ownerOf(396)`——
+  **任何人可離線驗證、免 gas、不需要 ConSSS 的任何 secret**。
+- **TEE 證據**：依 0G 官方 Verifiable Execution 文件，封章時向 provider 本人取
+  `GET {provider.url}/v1/proxy/signature/{chatID}` 的 `{text, signature}`，連同鏈上 `teeSignerAddress` 封入；
+  驗證時 `ecrecover(EIP-191(text), signature) == teeSignerAddress`，不信任 Router 也能核對。
+- **證明鏈**：偵察官章 → 指揮官章（`parent`），一回合兩枚，皆帶 `erc8004_agent_id: 396`。
+- **回退**：0G Router 失敗 → OpenAI 相容端點（印章標 `backend: openai-fallback`，無 TEE）→ 遊戲端確定性 AI。
 
 ### 印章長什麼樣
 
@@ -335,8 +349,10 @@ open http://localhost:8788/verify
 
 環境變數（CF Pages 專案設定或 `--binding`）：`OG_API_KEY`（必要，未設即 fallback；在 pc.0g.ai 連錢包、儲值、建 `sk-` key）、
 `OG_ROUTER_URL`（預設 `https://router-api.0g.ai/v1/chat/completions`）、`OG_MODEL`（預設 `0gm-1.0-35b-a3b`）、
-`OG_AGENT_ID`、`OG_SEAL_SECRET`（未設時用開發金鑰並在印章標 `dev_secret: true`）、
-`OG_TIMEOUT_MS`（預設 9000）、選配 KV 綁定 `AGENT_KV`（讓 `verify.html` 只貼 `proof_id` 也查得到）。
+`OG_AGENT_ID`（ERC-7857 `<合約>:<tokenId>`）、`OG_ERC8004_AGENT_ID`（396）、
+`OG_SIGNER_KEY` / `OG_SIGNER_ADDRESS`（Agentic ID 持有者錢包，EIP-191 封章；未設時退回 HMAC 開發模式 `sig_scheme: hmac-dev`）、
+`OG_SEAL_SECRET`（HMAC 開發模式用）、`OPENAI_API_KEY`（選配第二層回退）、
+`OG_TIMEOUT_MS`（預設 7000）、選配 KV 綁定 `AGENT_KV`。本機開發把這些放在 `.dev.vars`（已 gitignore）。
 
 ### Preview URL
 
@@ -346,8 +362,8 @@ open http://localhost:8788/verify
 npx wrangler pages deploy public --project-name consss-play --branch hack-0g
 ```
 
-- 遊戲：`https://hack-0g.consss-play.pages.dev/`
-- 驗證頁：`https://hack-0g.consss-play.pages.dev/verify`
+- **子網域：https://0g.conssswars.com/**（CNAME → `hack-0g.consss-play.pages.dev`，正式站 play.conssswars.com 不受影響）
+- Pitch：https://0g.conssswars.com/pitch · 驗證頁：https://0g.conssswars.com/verify · Agent 卡片：https://0g.conssswars.com/agent-card.json
 - 端點：`POST /agent/decide`、`POST /agent/verify`
 
 ## Local development

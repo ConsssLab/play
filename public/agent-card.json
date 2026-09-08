@@ -1,0 +1,22 @@
+{
+  "type": "https://eips.ethereum.org/EIPS/eip-8004#registration-v1",
+  "name": "ConSSS Wars — Chainoa Enemy Commander",
+  "description": "《鏈之迴響》的敵方指揮官 Agent。每回合經 0G Compute Router（0GM-1.0-35B-A3B，TEE 驗證）推理，偵察官→指揮官兩跳各出一枚 X-Agent-Proof 印章，任何人可離線驗證。",
+  "image": "https://0g.conssswars.com/index.icon.png",
+  "services": [
+    { "name": "web", "endpoint": "https://0g.conssswars.com/pitch" },
+    { "name": "decide", "endpoint": "https://0g.conssswars.com/agent/decide" },
+    { "name": "verify", "endpoint": "https://0g.conssswars.com/agent/verify" },
+    { "name": "verify-ui", "endpoint": "https://0g.conssswars.com/verify" }
+  ],
+  "registrations": [
+    { "agentId": 396, "agentRegistry": "eip155:16602:0x8004A818BFB912233c491871b3d84c89A494BD9e" }
+  ],
+  "x-consss": {
+    "erc7857_agentic_id": "0xC1Af70aB6Df042Ac0561e2758e2020B8caeE0d97:1",
+    "owner": "0x2CfB6fDc9764035cBb3407087D10Ae13193aFCB9",
+    "seal_scheme": "X-Agent-Proof v3：sha256(payload) + EIP-191 secp256k1 by owner + 0G x_0g_trace + provider TEE signature",
+    "model": "0gm-1.0-35b-a3b",
+    "router": "https://router-api.0g.ai/v1"
+  }
+}

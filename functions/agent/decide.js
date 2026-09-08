@@ -11,11 +11,28 @@
 // 一律回 HTTP 200 + { fallback: true }，讓遊戲端退回既有的確定性 simple AI。
 // 這支端點絕對不回 500 —— 戰鬥永遠能打完。
 //
-// 印章的封法（verify.js 以同一套規則離線驗證）：
-//   payload  = 決策的正規化欄位（見 buildSealPayload）
+// 印章的封法（verify.js 以同一套規則離線驗證）—— 依 0G 官方文件對齊：
+//   payload  = 決策的正規化欄位（見 buildSealPayload，v3）
 //   proof_id = sha256(payload) 前 16 碼
-//   sig      = HMAC-SHA256(OG_SEAL_SECRET, payload)
-//   router_proof = Router 回應中的 TEE 證明原文（由 extract_proof 取得）
+//   sig      = EIP-191 personal_sign(payload) by Agentic ID 持有者錢包（secp256k1）
+//              → 任何人 ecrecover 後對照鏈上 ownerOf(tokenId)，離線、免 gas、不需我方 secret
+//              （OG_SIGNER_KEY 未設時退回 HMAC 開發模式，印章標 sig_scheme: 'hmac-dev'）
+//   router_proof = 0G Router 的 TEE 證據：x_0g_trace + ZG-Res-Key
+//              + provider 在 TEE 內的 EIP-191 簽名原文（GET {provider.url}/v1/proxy/signature/{chatID}）
+//   erc8004_agent_id = 指揮官在 0G 官方 ERC-8004 Identity Registry 的 agentId
+
+import * as secp from '@noble/secp256k1';
+import { keccak_256 } from '@noble/hashes/sha3';
+import { hmac } from '@noble/hashes/hmac';
+import { sha256 as nobleSha256 } from '@noble/hashes/sha256';
+secp.etc.hmacSha256Sync = (k, ...m) => hmac(nobleSha256, k, secp.etc.concatBytes(...m));
+
+// 0G 主網 Inference Serving 合約（來源：@0gfoundation/0g-compute-ts-sdk constants）；
+// getService(provider) 回 provider 的 url 與 teeSignerAddress，用來向 provider 本人取 TEE 簽名。
+const OG_MAINNET_RPC = 'https://evmrpc.0g.ai';
+const OG_INFERENCE_CONTRACT = '0x47340d900bdFec2BD393c626E12ea0656F938d84';
+const TEE_SIG_TIMEOUT_MS = 3500;
+const providerServiceCache = new Map(); // provider address → { url, teeSigner }
 
 // ── 一行替換點 ①：Router 位址與驗證方式（已依 docs.0g.ai 填入正式值）──────
 // 0G Compute Router：OpenAI 相容，Authorization: Bearer sk-…，不需 per-request 錢包簽名。
@@ -62,11 +79,11 @@ export async function onRequestPost(context) {
       const brief = sp && typeof sp === 'object' ? String(sp.brief || '').trim().slice(0, 120) : '';
       if (brief) {
         const scoutProof = await sealDecision(env, {
-          role: 'scout', parent: null,
+          role: 'scout', parent: null, backend: '0g-router',
           civilization, turn, board,
           action: { name: String(sp.recommend || ''), target: 'player' },
           intentText: brief,
-          routerProof: extract_proof(sr.response, sr.json), chatId: sr.chatId,
+          routerProof: await extract_proof(sr.response, sr.json, env, sr.text), chatId: sr.chatId,
         });
         scout = { brief, recommend: String(sp.recommend || ''), proof: scoutProof, proof_id: scoutProof.proof_id };
       }
@@ -76,7 +93,16 @@ export async function onRequestPost(context) {
 
     // ── 第 2 跳：指揮官 Agent ──
     const messages = buildMessages(civilization, board, turn, validActions, scout ? scout.brief : '');
-    const { text, response, json, chatId } = await callRouter(env, messages);
+    let text, response, json, chatId, backend = '0g-router';
+    try {
+      ({ text, response, json, chatId } = await callRouter(env, messages));
+    } catch (e) {
+      // 第二層回退：OpenAI 相容端點（無 TEE 證明，印章會標 backend: 'openai-fallback'）；
+      // 沒設 OPENAI_API_KEY 就直接拋出，由最外層回 { fallback: true } 給遊戲端的確定性 AI。
+      if (!env.OPENAI_API_KEY) throw e;
+      ({ text, response, json, chatId } = await callOpenAIFallback(env, messages));
+      backend = 'openai-fallback';
+    }
     const parsed = parseJsonLoose(text);
     if (!parsed || typeof parsed !== 'object') {
       return jsonOut({ fallback: true, reason: 'unparseable reply' });
@@ -91,9 +117,11 @@ export async function onRequestPost(context) {
       target: String(parsed.target || 'player'),
     };
 
-    const routerProof = extract_proof(response, json);
+    const routerProof = backend === '0g-router'
+      ? await extract_proof(response, json, env, text)
+      : null;
     const proof = await sealDecision(env, {
-      role: 'commander', parent: scout ? scout.proof_id : null,
+      role: 'commander', parent: scout ? scout.proof_id : null, backend,
       civilization, turn, board, action, intentText, routerProof, chatId,
     });
 
@@ -180,16 +208,103 @@ async function callRouter(env, messages, timeoutMs) {
 //   provider     x_0g_trace.provider（provider 的鏈上地址）
 //   tee_verified x_0g_trace.tee_verified（Router 同步驗過 TEE 簽名的結果）
 // 若 Router 完全沒回這些欄位（例如換了別的 OpenAI 相容端點），回 null。
-function extract_proof(response, json) {
+async function extract_proof(response, json, env, replyText) {
   const resKey = response && response.headers && response.headers.get(OG_PROOF_HEADER);
   const trace = json && json.x_0g_trace;
   if (!resKey && !trace) return null;
+  const provider = trace && trace.provider ? String(trace.provider) : null;
+  const chatId = resKey ? String(resKey) : (json && json.id ? String(json.id) : null);
+  // 官方 Verifiable Execution 流程：getService(provider) → GET {url}/v1/proxy/signature/{chatID}
+  // → provider 在 TEE 內以 EIP-191 簽的 { text, signature }，連同 teeSignerAddress 一起封進印章。
+  const tee = await fetchTeeSignature(env, provider, chatId, json && json.model).catch(() => null);
   return JSON.stringify({
     res_key: resKey ? String(resKey) : null,
     request_id: trace && trace.request_id ? String(trace.request_id) : null,
-    provider: trace && trace.provider ? String(trace.provider) : null,
+    provider,
     tee_verified: trace && typeof trace.tee_verified !== 'undefined' ? trace.tee_verified : null,
+    tee_signer: tee ? tee.teeSigner : null,
+    tee_text: tee ? tee.text : null,
+    tee_signature: tee ? tee.signature : null,
+    reply_sha256: replyText ? bytesToHex(nobleSha256(new TextEncoder().encode(String(replyText)))) : null,
   });
+}
+
+async function fetchTeeSignature(env, provider, chatId, model) {
+  if (!provider || !chatId) return null;
+  const svc = await getProviderService(env, provider);
+  if (!svc || !svc.url) return null;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TEE_SIG_TIMEOUT_MS);
+  try {
+    const url = `${svc.url.replace(/\/+$/, '')}/v1/proxy/signature/${encodeURIComponent(chatId)}?model=${encodeURIComponent(model || '')}`;
+    const r = await fetch(url, { signal: ctrl.signal });
+    if (!r.ok) return null;
+    const j = await r.json();
+    if (!j || typeof j.signature !== 'string') return null;
+    return { teeSigner: svc.teeSigner, text: String(j.text || ''), signature: j.signature };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// eth_call InferenceServing.getService(address) 並手動解 ABI（避免引入 ethers）。
+// 回傳 tuple(provider, serviceType, url, inputPrice, outputPrice, updatedAt, model, verifiability, additionalInfo, teeSignerAddress)
+async function getProviderService(env, provider) {
+  const key = provider.toLowerCase();
+  if (providerServiceCache.has(key)) return providerServiceCache.get(key);
+  const selector = keccakSelector('getService(address)');
+  const data = '0x' + selector + key.replace(/^0x/, '').padStart(64, '0');
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TEE_SIG_TIMEOUT_MS);
+  try {
+    const r = await fetch(env.OG_MAINNET_RPC || OG_MAINNET_RPC, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, signal: ctrl.signal,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to: OG_INFERENCE_CONTRACT, data }, 'latest'] }),
+    });
+    const j = await r.json();
+    const hex = (j && j.result || '').replace(/^0x/, '');
+    if (hex.length < 64 * 11) return null;
+    const word = (i) => hex.slice(i * 64, i * 64 + 64);
+    const base = Number(BigInt('0x' + word(0))) / 32;          // tuple 起點（word 索引）
+    const strAt = (slot) => {
+      const off = Number(BigInt('0x' + word(base + slot))) / 32;
+      const len = Number(BigInt('0x' + word(base + off)));
+      const start = (base + off + 1) * 64;
+      return new TextDecoder().decode(hexToBytes(hex.slice(start, start + len * 2)));
+    };
+    const svc = { url: strAt(2), teeSigner: '0x' + word(base + 9).slice(24) };
+    providerServiceCache.set(key, svc);
+    return svc;
+  } catch (_) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// 第二層回退：OpenAI 相容 /chat/completions（形式與 backend/src/llm.mjs 相同）。
+async function callOpenAIFallback(env, messages) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), Number(env.OG_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS);
+  try {
+    const r = await fetch(env.OPENAI_API_URL || 'https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${env.OPENAI_API_KEY}` },
+      body: JSON.stringify({
+        model: env.OPENAI_MODEL || 'gpt-4o-mini',
+        messages, temperature: 0.4, max_tokens: 400,
+        response_format: { type: 'json_object' },
+      }),
+      signal: ctrl.signal,
+    });
+    if (!r.ok) throw new Error(`openai ${r.status}`);
+    const j = await r.json();
+    const txt = j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
+    if (!txt) throw new Error('openai empty');
+    return { text: txt, response: r, json: j, chatId: String((j && j.id) || '') };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // 偵察官 Agent：只讀盤面、不下決定，產出一句戰況簡報與建議行動，交給指揮官。
@@ -240,11 +355,21 @@ export function buildSealPayload(p) {
       chat_id: p.chat_id, router_proof: p.router_proof, ts: p.ts,
     });
   }
-  // v2：多 Agent 每跳出章 —— role 標明是哪個 Agent，parent 指向上一跳的 proof_id，串成證明鏈。
+  if (v === 2) {
+    return JSON.stringify({
+      v: 2, role: p.role, parent: p.parent,
+      agent_id: p.agent_id, model: p.model, civilization: p.civilization, turn: p.turn,
+      board_hash: p.board_hash, action: p.action, target: p.target, intent_text: p.intent_text,
+      chat_id: p.chat_id, router_proof: p.router_proof, ts: p.ts,
+    });
+  }
+  // v3：多 Agent 每跳出章（role / parent 串成證明鏈）＋ ERC-8004 agentId ＋ 推理後端。
   return JSON.stringify({
-    v: 2,
+    v: 3,
     role: p.role,
     parent: p.parent,
+    backend: p.backend,
+    erc8004_agent_id: p.erc8004_agent_id,
     agent_id: p.agent_id,
     model: p.model,
     civilization: p.civilization,
@@ -259,11 +384,13 @@ export function buildSealPayload(p) {
   });
 }
 
-async function sealDecision(env, { role, parent, civilization, turn, board, action, intentText, routerProof, chatId }) {
+async function sealDecision(env, { role, parent, backend, civilization, turn, board, action, intentText, routerProof, chatId }) {
   const fields = {
-    v: 2,
+    v: 3,
     role: role || 'commander',
     parent: parent || null,
+    backend: backend || '0g-router',
+    erc8004_agent_id: env.OG_ERC8004_AGENT_ID ? String(env.OG_ERC8004_AGENT_ID) : null,
     agent_id: String(env.OG_AGENT_ID || 'unregistered'),
     model: String(env.OG_MODEL || OG_MODEL),
     civilization,
@@ -278,9 +405,49 @@ async function sealDecision(env, { role, parent, civilization, turn, board, acti
   };
   const payload = buildSealPayload(fields);
   const proof_id = (await sha256Hex(payload)).slice(0, 16);
+  if (env.OG_SIGNER_KEY) {
+    // 正式模式：Agentic ID 持有者錢包的 EIP-191 簽名，任何人 ecrecover 即可離線驗。
+    const signer = addressFromPrivKey(env.OG_SIGNER_KEY);
+    const sig = eip191Sign(payload, env.OG_SIGNER_KEY);
+    return { ...fields, proof_id, sig, sig_scheme: 'eip191-secp256k1', signer, dev_secret: false };
+  }
   const secret = env.OG_SEAL_SECRET || DEV_SEAL_SECRET;
   const sig = await hmacHex(secret, payload);
-  return { ...fields, proof_id, sig, dev_secret: !env.OG_SEAL_SECRET };
+  return { ...fields, proof_id, sig, sig_scheme: 'hmac-dev', signer: null, dev_secret: !env.OG_SEAL_SECRET };
+}
+
+// ── EIP-191 personal_sign（與 ethers.hashMessage / recoverAddress 相容）──
+export function eip191Hash(message) {
+  const body = new TextEncoder().encode(String(message));
+  const prefix = new TextEncoder().encode(`\x19Ethereum Signed Message:\n${body.length}`);
+  return keccak_256(secp.etc.concatBytes(prefix, body));
+}
+export function eip191Sign(message, privHex) {
+  const priv = hexToBytes(String(privHex).replace(/^0x/, ''));
+  const sig = secp.sign(eip191Hash(message), priv, { lowS: true });
+  return '0x' + bytesToHex(sig.toCompactRawBytes()) + (27 + sig.recovery).toString(16).padStart(2, '0');
+}
+export function eip191Recover(message, sigHex) {
+  const raw = hexToBytes(String(sigHex).replace(/^0x/, ''));
+  if (raw.length !== 65) return null;
+  let v = raw[64];
+  if (v >= 27) v -= 27;
+  const sig = secp.Signature.fromCompact(raw.slice(0, 64)).addRecoveryBit(v);
+  const pub = sig.recoverPublicKey(eip191Hash(message)).toRawBytes(false);
+  return '0x' + bytesToHex(keccak_256(pub.slice(1)).slice(12));
+}
+export function addressFromPrivKey(privHex) {
+  const pub = secp.getPublicKey(hexToBytes(String(privHex).replace(/^0x/, '')), false);
+  return '0x' + bytesToHex(keccak_256(pub.slice(1)).slice(12));
+}
+export function hexToBytes(h) {
+  const a = new Uint8Array(h.length / 2);
+  for (let i = 0; i < a.length; i++) a[i] = parseInt(h.substr(i * 2, 2), 16);
+  return a;
+}
+export function bytesToHex(u) { return Array.from(u).map((x) => x.toString(16).padStart(2, '0')).join(''); }
+export function keccakSelector(signature) {
+  return bytesToHex(keccak_256(new TextEncoder().encode(signature))).slice(0, 8);
 }
 
 // 遞迴排序鍵名，讓同一個盤面永遠得到同一個 hash。
@@ -305,7 +472,7 @@ export async function hmacHex(secret, text) {
   return toHex(new Uint8Array(sig));
 }
 
-function toHex(u) { return Array.from(u).map((x) => x.toString(16).padStart(2, '0')).join(''); }
+function toHex(u) { return bytesToHex(u); }
 
 // 與 backend/src/llm.mjs 的 parseJsonLoose 逐字相同（該 repo 為 private，
 // Pages Function 無法 import，故原封照抄，不改任何一行）。
