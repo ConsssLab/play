@@ -60,6 +60,17 @@ a1b2c3d4e5f60718'></textarea>
   // 若網址帶 ?proof_id=…，自動填入並開始驗證（手機掃碼／分享連結用）。
   var qs = new URLSearchParams(location.search);
   if (qs.get('proof_id')) { input.value = qs.get('proof_id'); setTimeout(run, 0); }
+  // 遊戲結算「在瀏覽器驗證」按鈕：印章 JSON 以 base64url 放在 #seals=…（fragment 不會送到伺服器）。
+  var m = /[#&]seals=([A-Za-z0-9_-]+)/.exec(location.hash || '');
+  if (m) {
+    try {
+      var b64 = m[1].replace(/-/g, '+').replace(/_/g, '/');
+      while (b64.length % 4) b64 += '=';
+      var bytes = Uint8Array.from(atob(b64), function (c) { return c.charCodeAt(0); });
+      input.value = new TextDecoder().decode(bytes);
+      setTimeout(run, 0);
+    } catch (e) { hint.textContent = '無法解析網址中的印章：' + e; }
+  }
 
   document.getElementById('clear').onclick = function () { input.value = ''; out.innerHTML = ''; hint.textContent = ''; };
   runBtn.onclick = run;
