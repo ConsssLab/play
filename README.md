@@ -248,15 +248,28 @@ fully forward-compatible with the deployed mainnet package.
 ## 0G Taipei Hackathon — 可驗證的敵方指揮官 Agent（hack/0g 分支）
 
 > 賽道 A（可驗證推理）＋ B（有身份的 Agent）。把《鏈之迴響》關卡裡腳本化的敵方
-> AI，換成一個持有 **0G Agentic ID** 的指揮官 Agent：它每回合的決策都經由
-> **0G Compute Router**（模型 `0GM-1.0-35B-A3B`）推理，並封成一枚
-> **X-Agent-Proof 印章**；戰鬥結束時玩家可以當場逐章驗證。
+> AI，換成兩個持有 **0G Agentic ID**（ERC-7857 ＋ 官方 ERC-8004）的 Agent：
+> 偵察官讀盤面、指揮官下決定，每一跳都經 **0G Compute Router**（模型 `0GM-1.0-35B-A3B`，
+> TEE 驗證）推理，並各封成一枚 **X-Agent-Proof 印章**；戰鬥結束一鍵開瀏覽器逐章驗證。
 >
 > **為什麼要做**：目前鏈上戰績靠我方伺服器自簽的 ed25519 voucher 才發得出去，
 > 玩家必須先相信 ConSSS 沒作弊。換成 TEE 簽出的章之後，「AI 判了什麼」變成
 > 任何人都能獨立驗證的事實，不需要相信我們。
 
-**5 分鐘 Pitch 頁**：https://hack-0g.consss-play.pages.dev/pitch （`public/pitch.html`）
+**5 分鐘 Pitch 頁**：https://0g.conssswars.com/pitch （`public/pitch.html`）
+
+### 目前做到哪（2026-09-09）
+
+| 評審要求／加分項 | 狀態 | 證據 |
+|---|---|---|
+| 真的發出 0G API 請求 | ✅ | `router-api.0g.ai`，每回合兩次（偵察官、指揮官），回應帶 `x_0g_trace.tee_verified: true` |
+| 能跑的 Demo | ✅ | Godot 桌面版第二關 Boss 戰；線上 https://0g.conssswars.com/verify 現場驗章 |
+| 公開 repo ＋ README 指出整合點 | ✅ | 本節下方表格 |
+| 現場驗證證明 | ✅ | 結算「在瀏覽器驗證」一鍵帶入全部印章，逐章亮綠（含鏈上 ownerOf 與 provider TEE 簽名） |
+| 同時用上 Router 與 Agentic ID | ✅ | ERC-7857 `0xC1Af…0d97:1` ＋ 官方 ERC-8004 agentId 396 |
+| 使用模型 0GM-1.0-35B-A3B | ✅ | Router id `0gm-1.0-35b-a3b`，Private tier（TeeML / TDX） |
+| 多 Agent 協作 | ✅ | 偵察官 → 指揮官，每跳出章，`parent` 串成證明鏈 |
+| 賽道 C：印章上鏈（Reputation Registry 留評） | ⏳ Roadmap | 見文末 |
 
 ### 整合點（評審請看這裡）
 
@@ -269,9 +282,10 @@ fully forward-compatible with the deployed mainnet package.
 | TEE 證明取值（一行替換點 ②） | `functions/agent/decide.js` | `extract_proof()`。讀 `ZG-Res-Key` header ＋ `x_0g_trace.{request_id, provider, tee_verified}`，再向 provider 本人取 EIP-191 簽名 `{text, signature}` 與 `teeSignerAddress`，封成 JSON 字串進印章 |
 | **印章在哪裡封出** | `functions/agent/decide.js` | `sealDecision()`：`proof_id = sha256(payload)[:16]`、`sig = EIP-191 personal_sign(payload)` by Agentic ID 持有者錢包（`eip191Sign()`，secp256k1）；`extract_proof()` 依官方 Verifiable Execution 流程向 provider 取 TEE 簽名（`getService` → `/v1/proxy/signature/{chatID}`）一併封入 |
 | **印章在哪裡驗證** | `functions/agent/verify.js` | `onRequestPost`：重算 `proof_id`；`eip191Recover()` 還原簽名者並對照鏈上 ERC-7857 `ownerOf(1)` 與 ERC-8004 `ownerOf(396)`（Galileo eth_call）；`verify_router_proof()` 檢查 `tee_verified` 且 provider TEE 簽名 ecrecover == `teeSignerAddress` |
-| 現場驗證頁 | `public/verify.html` | 純靜態、無 build、無外部依賴，手機可開。貼印章或 `proof_id` → 逐章亮燈 |
+| 現場驗證頁 | `public/verify.html` | 純靜態、無 build、無外部依賴，手機可開。貼印章／`proof_id`，或由遊戲一鍵帶入 `#seals=<base64url>`（fragment 不經伺服器）→ 逐章亮燈 |
+| ERC-7857 合約原始碼與部署腳本 | `agentic-id/` | `AgenticID.sol`、`deploy_and_mint.mjs` |
 | 遊戲端 HTTP 封裝 | `app/godot/scripts/battle/agent_client.gd`（private repo） | `decide()` / `verify()`；逾時或非 2xx 回空 Dictionary |
-| 遊戲端接線 | `app/godot/scripts/battle/turn_battle.gd`（private repo） | 玩家回合開始就預取（第 4209 行）→ 敵方回合消費（第 5256 行）→ 印章標籤緊貼既有 `EnemyActionLabel`（`_og_proof_label`）→ 結算畫面「驗證這場戰鬥」（`_on_og_verify_pressed`） |
+| 遊戲端接線 | `app/godot/scripts/battle/turn_battle.gd`（private repo） | 玩家回合開始就預取（`_og_prefetch_commander_decision`）→ 敵方回合消費（`_og_consume_pending_decision`）→ 偵察簡報、指揮官思路與印章 hash 顯示在既有 `EnemyActionLabel` 旁（`_og_proof_label`）→ 結算「驗證這場戰鬥」逐章驗（`_on_og_verify_pressed`）與「在瀏覽器驗證」一鍵帶入全部印章（`_on_og_copy_pressed`） |
 
 **回退哲學（沿用 `backend/src/llm.mjs`）**：key 未設、逾時、非 2xx、回覆解析失敗、
 行動不在合法池內 —— `/agent/decide` 一律回 **HTTP 200 + `{ fallback: true }`**，
@@ -309,32 +323,43 @@ LLM 的幾秒延遲落在玩家思考技能的時間裡；敵方回合開始時�
 - **證明鏈**：偵察官章 → 指揮官章（`parent`），一回合兩枚，皆帶 `erc8004_agent_id: 396`。
 - **回退**：0G Router 失敗 → OpenAI 相容端點（印章標 `backend: openai-fallback`，無 TEE）→ 遊戲端確定性 AI。
 
-### 印章長什麼樣
+### 印章長什麼樣（v3，真實樣本節錄）
 
 ```json
 {
-  "v": 1, "agent_id": "<0G Agentic ID>", "model": "0GM-1.0-35B-A3B",
-  "civilization": "sui", "turn": 3, "board_hash": "<sha256 of canonical board_state>",
-  "action": "Heavy Strike", "target": "player", "intent_text": "先壓制對手的架式",
-  "chat_id": "<router response id>",
-  "router_proof": "{\"res_key\":\"<ZG-Res-Key>\",\"request_id\":\"<x_0g_trace.request_id>\",\"provider\":\"0xd996…471C\",\"tee_verified\":true}",
-  "ts": 1788750736006,
-  "proof_id": "c50cacf84a93d507", "sig": "<HMAC-SHA256 hex>"
+  "v": 3, "role": "commander", "parent": "f38a4dbdf37a8584", "backend": "0g-router",
+  "erc8004_agent_id": "396", "agent_id": "0xC1Af70aB6Df042Ac0561e2758e2020B8caeE0d97:1",
+  "model": "0gm-1.0-35b-a3b", "civilization": "sui", "turn": 3,
+  "board_hash": "ec3e5c7c…c5cce", "action": "Overload Burst", "target": "player",
+  "intent_text": "趁敵方架式高時，以爆發技擊潰其防線。",
+  "chat_id": "chatcmpl-aa80c54a-…",
+  "router_proof": "{\"res_key\":\"aa80c54a-…\",\"request_id\":\"6f1084c1-…\",\"provider\":\"0x4870CbC4…a4E9\",\"tee_verified\":true,\"tee_signer\":\"0xed42c0a6…5f22\",\"tee_text\":\"188f4e87…:c2b4a4b9…\",\"tee_signature\":\"0xc6238aba…\",\"reply_sha256\":\"ce5427bc…\"}",
+  "ts": 1788891990200,
+  "proof_id": "cbe4f49047f26289",
+  "sig": "0x8f34b3e4…1b", "sig_scheme": "eip191-secp256k1",
+  "signer": "0x2cfb6fdc9764035cbb3407087d10ae13193afcb9"
 }
 ```
 
-`verify.js` 逐項回報：`shape` / `proof_id_match` / `sig_match` / `router_proof_valid`。
-任何一個欄位被改（例如把 `action` 改掉），`proof_id_match` 與 `sig_match` 立刻變 `false`。
+`verify.js` 逐項回報：`shape` / `proof_id_match` / `signer`（ecrecover）/ `owner_erc7857_onchain` /
+`owner_erc8004_onchain` / `signer_is_owner` / `router_proof_valid` / `tee_signature_valid` / `parent`。
+任何一個欄位被改（例如把 `action` 改掉），`proof_id_match` 與 `signer_is_owner` 立刻變 `false`。
 
 ### 本機執行
 
 ```bash
-# 1. 起 Pages Functions（同源，不需 CORS）。沒有 mock Router 也能跑：decide 會回 fallback。
-cd play
-npx wrangler pages dev public --port 8788 \
-  --binding OG_API_KEY=sk-<在 pc.0g.ai 建的 API key> \
-  --binding OG_AGENT_ID=<Agentic ID，格式 <ERC-7857 合約>:<tokenId>> \
-  --binding OG_SEAL_SECRET=<隨機字串>
+# 0. 依賴（@noble/secp256k1、@noble/hashes 供 EIP-191 簽章／ecrecover）
+cd play && npm ci
+
+# 1. 起 Pages Functions（同源，不需 CORS）。金鑰放 .dev.vars（已 gitignore），沒設也能跑：decide 會回 fallback。
+cat > .dev.vars <<'EOF'
+OG_API_KEY=sk-<在 pc.0g.ai 建的 API key>
+OG_AGENT_ID=0xC1Af70aB6Df042Ac0561e2758e2020B8caeE0d97:1
+OG_ERC8004_AGENT_ID=396
+OG_SIGNER_KEY=0x<Agentic ID 持有者錢包私鑰，測試網用>
+OG_SIGNER_ADDRESS=0x2CfB6fDc9764035cBb3407087D10Ae13193aFCB9
+EOF
+npx wrangler pages dev public --port 8788
 
 # 2. 手動打一發
 curl -s -X POST localhost:8788/agent/decide -H 'content-type: application/json' \
@@ -365,6 +390,14 @@ npx wrangler pages deploy public --project-name consss-play --branch hack-0g
 - **子網域：https://0g.conssswars.com/**（CNAME → `hack-0g.consss-play.pages.dev`，正式站 play.conssswars.com 不受影響）
 - Pitch：https://0g.conssswars.com/pitch · 驗證頁：https://0g.conssswars.com/verify · Agent 卡片：https://0g.conssswars.com/agent-card.json
 - 端點：`POST /agent/decide`、`POST /agent/verify`
+- 注意：線上首頁的遊戲仍是 v1.0.0 的 Web 匯出（未含本分支的 Godot 改動），戰鬥內的印章 Demo 走 Godot 桌面版；
+  線上提供的是驗證頁、兩支 API、Agent 卡片與 Pitch。
+
+### Roadmap（黑客松後）
+
+- 賽道 C：每場戰鬥的印章 Merkle root 寫進 0G 官方 ERC-8004 Reputation Registry（Galileo `0x8004B663…8713`），成為 On-Chain Agent。
+- 把「AI 判斷可驗證」延伸到「整場戰鬥可驗證」：server 重播或 zk-proof 驗證結算公式。
+- Agentic ID 的智慧內容改存 0G Storage 加密 blob；Web 匯出重新打包，讓線上也能看到戰鬥內印章。
 
 ## Local development
 
